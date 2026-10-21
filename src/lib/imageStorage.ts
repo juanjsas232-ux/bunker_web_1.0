@@ -1,9 +1,6 @@
+
 import { getSupabaseClient, isSupabaseConfigured } from './supabase';
 
-/**
- * Optimizes and compresses an image file using an HTML5 Canvas to WebP or high-quality JPEG.
- * This guarantees ultra-fast loading, crisp visual fidelity, and prevents heavy files.
- */
 export async function optimizeImageFile(
   file: File,
   maxWidth = 1200,
@@ -13,42 +10,38 @@ export async function optimizeImageFile(
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
 
-    reader.onload = (readerEvent) => {
+    reader.onerror = () => reject(new Error('No se pudo leer la imagen.'));
+
+    reader.onload = () => {
       const img = new Image();
+
+      img.onerror = () => reject(new Error('No se pudo procesar la imagen.'));
 
       img.onload = () => {
         let width = img.width;
         let height = img.height;
 
-        if (width > height) {
-          if (width > maxWidth) {
-            height = Math.round((height * maxWidth) / width);
-            width = maxWidth;
-          }
-        } else {
-          if (height > maxHeight) {
-            width = Math.round((width * maxHeight) / height);
-            height = maxHeight;
-          }
-        }
+        const scale = Math.min(1, maxWidth / width, maxHeight / height);
+        width = Math.max(1, Math.round(width * scale));
+        height = Math.max(1, Math.round(height * scale));
 
         const canvas = document.createElement('canvas');
         canvas.width = width;
         canvas.height = height;
+
         const ctx = canvas.getContext('2d');
 
         if (!ctx) {
-          resolve(readerEvent.target?.result as string);
+          reject(new Error('No se pudo preparar la imagen.'));
           return;
         }
 
-        // Clean white background for transparent PNGs converted to JPEG/WebP
         ctx.fillStyle = '#FFFFFF';
         ctx.fillRect(0, 0, width, height);
         ctx.drawImage(img, 0, 0, width, height);
 
-        // Export as WebP if supported, fallback to JPEG
         let dataUrl = canvas.toDataURL('image/webp', quality);
+
         if (!dataUrl.startsWith('data:image/webp')) {
           dataUrl = canvas.toDataURL('image/jpeg', quality);
         }
@@ -56,51 +49,76 @@ export async function optimizeImageFile(
         resolve(dataUrl);
       };
 
-      img.onerror = (err) => reject(err);
-      img.src = readerEvent.target?.result as string;
+      img.src = reader.result as string;
     };
 
-    reader.onerror = (err) => reject(err);
     reader.readAsDataURL(file);
   });
 }
 
-/**
- * Uploads a product photo:
- * 1. If Supabase Storage is connected, uploads to the 'product-images' bucket and returns CDN public URL.
- * 2. If running locally or offline, compresses into an optimized WebP Data URL that is permanently stored in the website database.
- */
-export async function uploadProductImage(file: File, folder = 'products'): Promise<string> {
-  const supabase = getSupabaseClient();
-
-  if (supabase && isSupabaseConfigured()) {
-    try {
-      const ext = file.name.split('.').pop() || 'webp';
-      const cleanName = `${folder}/${Date.now()}-${Math.random().toString(36).substring(2, 7)}.${ext}`;
-
-      const { data, error } = await supabase.storage
-        .from('product-images')
-        .upload(cleanName, file, {
-          cacheControl: '3600',
-          upsert: true,
-        });
-
-      if (!error && data) {
-        const { data: urlData } = supabase.storage
-          .from('product-images')
-          .getPublicUrl(cleanName);
-
-        if (urlData?.publicUrl) {
-          return urlData.publicUrl;
-        }
-      } else {
-        console.warn('Supabase storage upload returned error, falling back to optimized local storage:', error?.message);
-      }
-    } catch (err) {
-      console.warn('Error in Supabase storage upload:', err);
-    }
+export async function uploadProductImage(
+  file: File,
+  folder = 'products'
+): Promise<string> {
+  if (!file || file.size === 0) {
+    throw new Error('El archivo seleccionado está vacío.');
   }
 
-  // Fallback: Local client-side optimized storage
-  return await optimizeImageFile(file);
+  if (!file.type.startsWith('image/')) {
+    throw new Error('El archivo seleccionado no es una imagen válida.');
+  }
+
+  if (isSupabaseConfigured()) {
+    const supabase = getSupabaseClient();
+
+    if (!supabase) {
+      throw new Error('No se pudo conectar con Supabase. Revisá la configuración.');
+    }
+
+    const extensionByType: Record<string, string> = {
+      'image/jpeg': 'jpg',
+      'image/png': 'png',
+      'image/webp': 'webp',
+      'image/gif': 'gif',
+      'image/avif': 'avif',
+      'image/heic': 'heic',
+      'image/heif': 'heif',
+    };
+
+    const extension =
+      extensionByType[file.type.toLowerCase()] || 'jpg';
+
+    const safeFolder = folder.replace(/[^a-zA-Z0-9_-]/g, '') || 'products';
+    const filePath =
+      `${safeFolder}/${crypto.randomUUID()}.${extension}`;
+
+    const { data, error } = await supabase.storage
+      .from('product-images')
+      .upload(filePath, file, {
+        cacheControl: '3600',
+        upsert: false,
+        contentType: file.type,
+      });
+
+    if (error) {
+      console.error('Error subiendo imagen a Supabase:', error);
+      throw new Error(`No se pudo subir la imagen: ${error.message}`);
+    }
+
+    if (!data?.path) {
+      throw new Error('Supabase no confirmó la subida de la imagen.');
+    }
+
+    const { data: urlData } = supabase.storage
+      .from('product-images')
+      .getPublicUrl(data.path);
+
+    if (!urlData?.publicUrl) {
+      throw new Error('No se pudo obtener la dirección pública de la imagen.');
+    }
+
+    return urlData.publicUrl;
+  }
+
+  return optimizeImageFile(file);
 }
